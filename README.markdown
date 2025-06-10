@@ -107,16 +107,12 @@ TariffBot is an AI-powered tool designed to assist importers, analysts, and trad
 - **Missing Data**: Verify that all CSV files and the General Notes PDF are in the correct paths specified in `Config`.
 - **RAG Issues**: If RAG responses are vague, check the FAISS index (`faiss_index/`) and force re-ingestion via the Streamlit checkbox.
 
-## Demo Video
 
-A demo video showcasing TariffBot’s capabilities is available at [Insert Link]. It demonstrates the RAG and tariff calculator agents using the sample queries, along with bonus features like export options and multi-section ingestion.
 
 ## Submission Details
 
-This project was developed for the HTS AI Agent coding task by [Your Name]. For feedback or inquiries, contact [Your Email].
+This project was developed for the HTS AI Agent coding task by Shashwat Shlok. For feedback or inquiries, contact sshashwat10@gmail.com.
 
-- GitHub Repository: [Insert Link]
-- Demo Video: [Insert Link]
 
 ## Acknowledgments
 
