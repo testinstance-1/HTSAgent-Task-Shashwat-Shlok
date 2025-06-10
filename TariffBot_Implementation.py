@@ -35,11 +35,38 @@ class Config:
     ALL_CSV_PATHS = [
         r"C:\Users\sshas\Downloads\HTSAgent\data\htsdata.csv",
         r"C:\Users\sshas\Downloads\HTSAgent\data\htsdata (1).csv"
-        r"C:\Users\sshas\Downloads\HTSAgent\data\htsdata (2).csv",
+        r"C:\Users\sshas\Downloads\HTSAgent\data\htsdata (2).csv"
         r"C:\Users\sshas\Downloads\HTSAgent\data\htsdata (3).csv",
         r"C:\Users\sshas\Downloads\HTSAgent\data\htsdata (4).csv",
     ]
     ENABLE_MULTI_SECTION = True
+
+
+
+# Initialize embedding model
+embeddings = HuggingFaceEmbeddings(
+    model_name=Config.EMBEDDING_MODEL,  # "sentence-transformers/all-mpnet-base-v2"
+    model_kwargs={},
+    encode_kwargs={"normalize_embeddings": True}
+)
+
+# Initialize LLM
+model_name = Config.LLM_MODEL
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForSeq2SeqLM.from_pretrained(
+    model_name,
+    device_map=None,
+    torch_dtype=torch.float32
+)
+hf_pipeline = pipeline(
+    "text2text-generation",
+    model=model,
+    tokenizer=tokenizer,
+    max_length=1024,
+    device=-1  # CPU
+)
+llm = HuggingFacePipeline(pipeline=hf_pipeline)
+
 
 class HTSValidator:
     @staticmethod
@@ -73,28 +100,6 @@ class HTSValidator:
         return suggestions
 
 # Initialize embedding model
-embeddings = HuggingFaceEmbeddings(
-    model_name=Config.EMBEDDING_MODEL,
-    model_kwargs={'device': 'cpu', 'trust_remote_code': True}
-)
-
-# Initialize LLM
-model_name = Config.LLM_MODEL
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForSeq2SeqLM.from_pretrained(
-    model_name,
-    device_map=None,
-    torch_dtype=torch.float32,
-    trust_remote_code=True
-)
-hf_pipeline = pipeline(
-    "text2text-generation",
-    model=model,
-    tokenizer=tokenizer,
-    max_length=1024,
-    device=-1
-)
-llm = HuggingFacePipeline(pipeline=hf_pipeline)
 
 # Custom Prompt Template
 CUSTOM_PROMPT_TEMPLATE = """
