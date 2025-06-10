@@ -1,0 +1,11 @@
+pandas
+sqlite3
+langchain
+langchain-community
+langchain-huggingface
+streamlit
+fpdf
+PyPDF2
+transformers
+torch
+xlsxwriter
