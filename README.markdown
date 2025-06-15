@@ -128,7 +128,7 @@ TariffBot is an AI-powered multi-tool agent designed to assist importers, analys
 
 ## Demo Video
 
-A demo video showcasing TariffBot’s RAG and tariff calculator capabilities is available at [Insert Video Link]. It covers the sample queries:
+A demo video showcasing TariffBot’s RAG and tariff calculator capabilities is available at (https://drive.google.com/file/d/1HhuoHI_C886C7nBzGDdWqX1jGsoBmxK_/view?usp=sharing). It covers the sample queries:
 - RAG: United States-Israel FTA, tariff-rate quotas, and classification rules.
 - Tariff: Duty calculation for HTS 0101.30.00.00, HTS code for donkeys, and duty rates for female cattle.
 
