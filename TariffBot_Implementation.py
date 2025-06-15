@@ -1,905 +1,669 @@
-import os
-import re
-import sqlite3
-import pandas as pd
-from typing import List, Dict, Any, Optional
-from fpdf import FPDF
-from datetime import datetime
-import PyPDF2
-from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_huggingface import HuggingFacePipeline
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
-from langchain.prompts import PromptTemplate
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from transformers import pipeline, AutoModelForSeq2SeqLM, AutoTokenizer
-import torch
-import logging
 import streamlit as st
+import duckdb
+import pandas as pd
+import re
+import os
+import logging
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from datetime import datetime
+import warnings
+import json
+import openpyxl
+from langchain.agents import Tool, initialize_agent
+from langchain.memory import ConversationBufferMemory
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_ollama import OllamaLLM
+
+# Set environment variables before any imports
+os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
+os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'  
+
+# Suppress warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pandas")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="langchain")
 
 # Setup logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Configuration
-class Config:
-    DB_NAME = r"C:\Users\sshas\Downloads\HTSAgent\data\hts_data.db"
-    VECTOR_STORE_PATH = r"C:\Users\sshas\Downloads\HTSAgent\faiss_index"
-    EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
-    LLM_MODEL = "google/flan-t5-large"
-    CHUNK_SIZE = 500
-    CHUNK_OVERLAP = 50
-    CSV_PATH = r"C:\Users\sshas\Downloads\HTSAgent\data\hts_2025_basic_edition_csv.csv"
-    PDF_PATH = r"C:\Users\sshas\Downloads\HTSAgent\data\General Notes.pdf"
-    ALL_CSV_PATHS = [
-        r"C:\Users\sshas\Downloads\HTSAgent\data\htsdata.csv",
-        r"C:\Users\sshas\Downloads\HTSAgent\data\htsdata (1).csv"
-        r"C:\Users\sshas\Downloads\HTSAgent\data\htsdata (2).csv"
-        r"C:\Users\sshas\Downloads\HTSAgent\data\htsdata (3).csv",
-        r"C:\Users\sshas\Downloads\HTSAgent\data\htsdata (4).csv",
-    ]
-    ENABLE_MULTI_SECTION = True
+# Initialize LLM (Mistral 7B via Ollama)
+llm = OllamaLLM(model="mistral:7b", base_url="http://localhost:11434")
 
+# Initialize embeddings 
+try:
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"},
+        cache_folder=r"C:\Users\sshas\.cache\huggingface\hub\models--sentence-transformers--all-MiniLM-L6-v2\snapshots\c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
+    )
+except Exception as e:
+    logger.error(f"Failed to load embeddings: {str(e)}")
+    st.error(f"Failed to load embeddings model: {str(e)}. Ensure the model files are present at the specified cache folder.")
+    raise
 
+# Paths to data
+GENERAL_NOTES_PATH = r"C:\Users\sshas\Downloads\HTSAgent\data\General Notes.pdf"
+CSV_PATHS = [
+    r"C:\Users\sshas\Downloads\HTSAgent\data\htsdata.csv",
+    r"C:\Users\sshas\Downloads\HTSAgent\data\htsdata (1).csv",
+    r"C:\Users\sshas\Downloads\HTSAgent\data\htsdata (2).csv",
+    r"C:\Users\sshas\Downloads\HTSAgent\data\htsdata (3).csv",
+    r"C:\Users\sshas\Downloads\HTSAgent\data\htsdata (4).csv"
+]
 
-# Initialize embedding model
-embeddings = HuggingFaceEmbeddings(
-    model_name=Config.EMBEDDING_MODEL,  # "sentence-transformers/all-mpnet-base-v2"
-    model_kwargs={},
-    encode_kwargs={"normalize_embeddings": True}
-)
+# Country mapping
+COUNTRY_MAPPING = {
+    "AU": "Australia",
+    "CA": "Canada",
+    "MX": "Mexico",
+    "IL": "Israel",
+    "IN": "India",
+    "US": "United States",
+    "DE": "Germany",
+}
 
-# Initialize LLM
-model_name = Config.LLM_MODEL
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForSeq2SeqLM.from_pretrained(
-    model_name,
-    device_map=None,
-    torch_dtype=torch.float32
-)
-hf_pipeline = pipeline(
-    "text2text-generation",
-    model=model,
-    tokenizer=tokenizer,
-    max_length=1024,
-    device=-1  # CPU
-)
-llm = HuggingFacePipeline(pipeline=hf_pipeline)
-
-
-class HTSValidator:
-    @staticmethod
-    def validate_hts_code(code: str) -> bool:
-        """Validate HTS code format"""
-        if not code:
-            return False
-        code = code.replace(" ", "").upper()
-        pattern = r'^\d{4}\.\d{2}\.\d{2}\.\d{2}$'
-        return bool(re.match(pattern, code))
-    
-    @staticmethod
-    def normalize_hts_code(code: str) -> str:
-        """Normalize HTS code format"""
-        if not code:
-            return ""
-        return code.replace(" ", "").upper().strip()
-    
-    @staticmethod
-    def suggest_corrections(code: str, all_codes: List[str]) -> List[str]:
-        """Suggest close HTS code matches"""
-        if not code or not all_codes:
-            return []
-        code = HTSValidator.normalize_hts_code(code)
-        suggestions = []
-        for existing_code in all_codes[:100]:
-            if existing_code.startswith(code[:4]):
-                suggestions.append(existing_code)
-            if len(suggestions) >= 5:
-                break
-        return suggestions
-
-# Initialize embedding model
-
-# Custom Prompt Template
-CUSTOM_PROMPT_TEMPLATE = """
-You are TariffBot — an intelligent assistant trained on U.S. International Trade Commission data. 
-You exist to help importers, analysts, and trade professionals quickly understand tariff rules, duty rates, and policy agreements.
-You always provide clear, compliant, and factual answers grounded in official HTS documentation.
-
-When given an HTS code and product information, explain all applicable duties and cost components thoroughly.
-
-When asked about trade agreements (e.g., NAFTA, Israel FTA), reference the relevant General Notes with citations.
-
-If a query is ambiguous or unsupported, politely defer or recommend reviewing the relevant HTS section manually.
-
-Do not speculate or make policy interpretations — clarify with precision and data.
-
-Always provide at least 2 relevant sentences in your response.
-
-Context: {context}
-Question: {question}
-Helpful Answer:
-"""
+# Initialize DuckDB
+conn = duckdb.connect("hts.db")
 
 # Data Ingestion
-def create_database_schema():
-    logger.info(f"Creating database schema at {Config.DB_NAME}")
-    os.makedirs(os.path.dirname(Config.DB_NAME), exist_ok=True)
-    try:
-        conn = sqlite3.connect(Config.DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS hts_codes (
-            hts_code TEXT PRIMARY KEY,
-            indent INTEGER,
-            description TEXT,
-            unit_of_quantity TEXT,
-            general_rate_of_duty TEXT,
-            special_rate_of_duty TEXT,
-            column_2_rate_of_duty TEXT,
-            quota_quantity TEXT,
-            additional_duties TEXT,
-            section TEXT,
-            chapter TEXT,
-            section_name TEXT,
-            is_heading INTEGER DEFAULT 0,
-            parent_heading TEXT,
-            statistical_suffix TEXT
-        )
-        """)
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS country_codes (
-            code TEXT PRIMARY KEY,
-            name TEXT,
-            region TEXT,
-            is_fta_member INTEGER,
-            fta_name TEXT,
-            special_program TEXT,
-            notes TEXT
-        )
-        """)
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS citations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            query TEXT,
-            source_document TEXT,
-            page_number INTEGER,
-            section_reference TEXT,
-            citation_text TEXT,
-            timestamp TEXT
-        )
-        """)
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS query_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            query_type TEXT,
-            query_text TEXT,
-            response_text TEXT
-        )
-        """)
-        conn.commit()
-    except Exception as e:
-        logger.error(f"Failed to create database schema: {e}")
-        raise
-    finally:
-        conn.close()
-
-def load_country_codes():
-    logger.info("Loading enhanced country codes")
-    countries = [
-        ("US", "United States", "North America", 0, "", "", ""),
-        ("CA", "Canada", "North America", 1, "USMCA", "GSP", "NAFTA successor"),
-        ("MX", "Mexico", "North America", 1, "USMCA", "GSP", "NAFTA successor"),
-        ("IL", "Israel", "Middle East", 1, "USFTA", "", "United States-Israel FTA"),
-        ("AU", "Australia", "Oceania", 1, "AUSFTA", "", "Australia-US FTA"),
-        ("GB", "United Kingdom", "Europe", 0, "", "", "Post-Brexit status"),
-        ("CN", "China", "Asia", 0, "", "", "MFN status"),
-        ("JP", "Japan", "Asia", 1, "USJTA", "", "US-Japan Trade Agreement"),
-        ("KR", "South Korea", "Asia", 1, "KORUS", "", "Korea-US FTA"),
-        ("SG", "Singapore", "Asia", 1, "USSFTA", "GSP", "US-Singapore FTA"),
-        ("JO", "Jordan", "Middle East", 1, "USJFTA", "", "US-Jordan FTA"),
-        ("CL", "Chile", "South America", 1, "USCFTA", "GSP", "US-Chile FTA"),
-        ("PE", "Peru", "South America", 1, "USPFTA", "GSP", "US-Peru FTA"),
-        ("CO", "Colombia", "South America", 1, "USCTPA", "GSP", "US-Colombia TPA"),
-        ("PA", "Panama", "Central America", 1, "USPTPA", "GSP", "US-Panama TPA"),
-    ]
-    try:
-        conn = sqlite3.connect(Config.DB_NAME)
-        cursor = conn.cursor()
-        cursor.executemany("INSERT OR REPLACE INTO country_codes VALUES (?, ?, ?, ?, ?, ?, ?)", countries)
-        conn.commit()
-    except Exception as e:
-        logger.error(f"Failed to load country codes: {e}")
-        raise
-    finally:
-        conn.close()
-
-def ingest_hts_csv(csv_path: str):
-    logger.info(f"Ingesting HTS CSV from {csv_path}")
-    try:
-        df = pd.read_csv(csv_path)
-        df = df.where(pd.notnull(df), None)
-        expected_headers = [
-            'HTS Number', 'Indent', 'Description', 'Unit of Quantity',
-            'General Rate of Duty', 'Special Rate of Duty', 'Column 2 Rate of Duty',
-            'Quota Quantity', 'Additional Duties'
-        ]
-        if not all(h in df.columns for h in expected_headers):
-            missing = [h for h in expected_headers if h not in df.columns]
-            raise ValueError(f"Missing CSV headers: {missing}")
-        df = df.rename(columns={
-            'HTS Number': 'hts_code',
-            'Indent': 'indent',
-            'Description': 'description',
-            'Unit of Quantity': 'unit_of_quantity',
-            'General Rate of Duty': 'general_rate_of_duty',
-            'Special Rate of Duty': 'special_rate_of_duty',
-            'Column 2 Rate of Duty': 'column_2_rate_of_duty',
-            'Quota Quantity': 'quota_quantity',
-            'Additional Duties': 'additional_duties'
-        })
-        df['section'] = df['hts_code'].str.split('.').str[0].str[:2]
-        df['chapter'] = df['hts_code'].str.split('.').str[0]
-        conn = sqlite3.connect(Config.DB_NAME)
-        df.to_sql('hts_codes', conn, if_exists='append', index=False)
-        logger.info("HTS CSV ingested successfully")
-    except Exception as e:
-        logger.error(f"Failed to ingest HTS CSV: {e}")
-        raise
-    finally:
-        conn.close()
-
-def ingest_all_csvs():
-    logger.info("Ingesting all CSV files")
-    if Config.ENABLE_MULTI_SECTION:
-        for csv_path in Config.ALL_CSV_PATHS:
-            if os.path.exists(csv_path):
-                ingest_hts_csv(csv_path)
-            else:
-                logger.warning(f"CSV file not found: {csv_path}")
+def ingest_data():
+    logger.info("Starting data ingestion...")
+    
+    # Ingest CSVs
+    dfs = []
+    missing_files = []
+    for csv_path in CSV_PATHS:
+        if os.path.exists(csv_path):
+            logger.info(f"Loading CSV: {csv_path}")
+            df = pd.read_csv(csv_path)
+            for code, name in COUNTRY_MAPPING.items():
+                df["Special Rate of Duty"] = df["Special Rate of Duty"].str.replace(code, name, regex=False)
+            dfs.append(df)
+        else:
+            logger.warning(f"CSV file not found: {csv_path}")
+            missing_files.append(csv_path)
+    if missing_files:
+        st.warning(f"Missing CSV files: {', '.join(missing_files)}. Download additional HTS data from https://hts.usitc.gov/export or https://catalog.data.gov/dataset/harmonized-tariff-schedule-of-the-united-states-2025.")
+    if dfs:
+        combined_df = pd.concat(dfs, ignore_index=True)
+        combined_df["HTS Number"] = combined_df["HTS Number"].str.strip().str.replace(r'[^\d.]', '', regex=True)
+        logger.info("Writing combined CSV data to DuckDB")
+        conn.execute("CREATE OR REPLACE TABLE hts_data AS SELECT * FROM combined_df")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hts_number ON hts_data(\"HTS Number\")")
     else:
-        if os.path.exists(Config.CSV_PATH):
-            ingest_hts_csv(Config.CSV_PATH)
-        else:
-            raise FileNotFoundError(f"HTS CSV file not found at {Config.CSV_PATH}")
+        logger.error("No CSV files were loaded")
+        st.error("No CSV files were loaded. Please ensure at least one HTS CSV file is available.")
 
-def ingest_pdf_documents(pdf_path: str):
-    logger.info(f"Ingesting PDF from {pdf_path}")
-    try:
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=Config.CHUNK_SIZE,
-            chunk_overlap=Config.CHUNK_OVERLAP
-        )
-        with open(pdf_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            text = ""
-            for page in reader.pages:
-                extracted_text = page.extract_text()
-                if extracted_text:
-                    text += extracted_text
-        if not text:
-            raise ValueError("No text extracted from PDF. Ensure the PDF contains readable text.")
-        chunks = text_splitter.split_text(text)
-        vectorstore = FAISS.from_texts(chunks, embeddings)
-        vectorstore.save_local(Config.VECTOR_STORE_PATH)
-        logger.info("PDF documents processed successfully")
-    except Exception as e:
-        logger.error(f"Failed to ingest PDF: {e}")
-        raise
-
-# Initialize database and vector store
-def initialize_system(force_reingest: bool = False):
-    logger.info("Initializing system")
-    try:
-        create_database_schema()
-        load_country_codes()
-        ingest_all_csvs()
-        vector_store_path = os.path.normpath(Config.VECTOR_STORE_PATH)
-        faiss_index_path = os.path.normpath(os.path.join(Config.VECTOR_STORE_PATH, "index.faiss"))
-        if not force_reingest and os.path.exists(vector_store_path) and os.path.exists(faiss_index_path):
+    # Ingest General Notes PDF
+    persist_dir = "./chroma_db"
+    if os.path.exists(persist_dir) and os.path.isdir(persist_dir):
+        logger.info("Chroma vector store already exists, skipping PDF ingestion")
+    else:
+        if os.path.exists(GENERAL_NOTES_PATH):
+            logger.info(f"Loading PDF: {GENERAL_NOTES_PATH}")
             try:
-                with open(faiss_index_path, 'rb') as f:
-                    pass
-                logger.info(f"FAISS index found and accessible at {vector_store_path}")
-            except (IOError, PermissionError) as e:
-                logger.error(f"FAISS index exists but is not accessible: {e}")
-                raise RuntimeError(f"Cannot access FAISS index: {str(e)}")
+                loader = PyMuPDFLoader(GENERAL_NOTES_PATH)
+                documents = loader.load()
+                text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+                chunks = text_splitter.split_documents(documents)
+                logger.info("Creating Chroma vector store")
+                Chroma.from_documents(
+                    chunks, 
+                    embeddings, 
+                    collection_name="general_notes",
+                    persist_directory=persist_dir
+                )
+                logger.info("PDF ingestion completed")
+            except Exception as e:
+                logger.error(f"Error ingesting PDF: {str(e)}")
+                st.error(f"Error ingesting General Notes PDF: {str(e)}")
         else:
-            logger.info(f"FAISS index not found or force re-ingestion requested")
-            if os.path.exists(Config.PDF_PATH):
-                ingest_pdf_documents(Config.PDF_PATH)
-            else:
-                raise FileNotFoundError(f"PDF document not found at {Config.PDF_PATH}")
-        return True, "Initialization successful."
-    except Exception as e:
-        logger.error(f"System initialization failed: {e}")
-        return False, f"Initialization failed: {str(e)}"
+            logger.error(f"General Notes PDF not found at: {GENERAL_NOTES_PATH}")
+            st.error(f"General Notes PDF not found at: {GENERAL_NOTES_PATH}")
 
-# Tools
-def parse_duty_advanced(duty_str: str, unit_weight: float = None, 
-                       quantity: int = None, cif_value: float = None) -> Dict[str, Any]:
-    """Advanced duty parser handling all formats"""
-    if not duty_str or pd.isna(duty_str) or str(duty_str).strip().lower() == "free":
-        return {"rate": 0.0, "amount": 0.0, "type": "free", "original": duty_str}
-    
-    duty_str = str(duty_str).strip().lower()
-    result = {"rate": 0.0, "amount": 0.0, "type": "unknown", "original": duty_str}
-    
+# Load General Notes for RAG
+def load_general_notes():
+    try:
+        vectorstore = Chroma(
+            collection_name="general_notes", 
+            embedding_function=embeddings, 
+            persist_directory="./chroma_db"
+        )
+        return vectorstore.as_retriever()
+    except Exception as e:
+        logger.error(f"Error loading vector store: {str(e)}")
+        st.error(f"Error loading vector store: {str(e)}")
+        return None
+
+# Enhanced RAG Tool
+def rag_tool_func(query):
+    retriever = load_general_notes()
+    if retriever is None:
+        return "Error: Unable to load General Notes data."
+    try:
+        docs = retriever.invoke(query)
+        if not docs:
+            return "No relevant information found in General Notes."
+        
+        content = docs[0].page_content
+        hts_codes = re.findall(r'\b\d{4}\.\d{2}\.\d{2}\.\d{2}\b', content)
+        
+        response = content[:2000]
+        if hts_codes:
+            response += f"\n\nRelated HTS codes: {', '.join(hts_codes[:3])}"
+        
+        return response
+    except Exception as e:
+        logger.error(f"Error invoking RAG tool: {str(e)}")
+        return f"Error processing query: {str(e)}"
+
+# HTS Code Lookup Tool
+def hts_lookup_func(product_name):
+    try:
+        product_name = re.sub(r'[^\w\s]', '', product_name).strip().lower()
+        query = "SELECT * FROM hts_data WHERE LOWER(\"Description\") LIKE ?"
+        df = conn.execute(query, [f"%{product_name}%"]).fetch_df()
+        
+        if df.empty:
+            return f"No HTS codes found for '{product_name}'"
+        
+        results = []
+        for _, row in df.iterrows():
+            results.append(f"{row['HTS Number']}: {row['Description']}")
+        
+        return "\n".join(results[:5])
+    except Exception as e:
+        logger.error(f"Error in HTS lookup: {str(e)}")
+        return f"Error looking up HTS codes: {str(e)}"
+
+# Duty Parser
+def parse_duty_advanced(duty_str, unit_weight=None, quantity=None, cif_value=None, country=None):
+    if pd.isna(duty_str) or duty_str.strip() == "":
+        return 0.0
+    duty_str = duty_str.strip().lower()
     if "free" in duty_str:
-        result["type"] = "conditional_free"
-        return result
-    
+        return 0.0
+
+    if country and "(" in duty_str:
+        country = country.lower()
+        matches = re.findall(r"([\w\s]+)\s*\(([\w\s,]+)\)", duty_str)
+        for rate, countries in matches:
+            rate = rate.strip()
+            countries = [c.strip().lower() for c in countries.split(",")]
+            if country in countries:
+                if "free" in rate:
+                    return 0.0
+                match = re.search(r"([\d.]+)\s*%", rate)
+                if match:
+                    return float(match.group(1)) / 100
+                match = re.search(r"([\d.]+)\s*¢/kg", rate)
+                if match and unit_weight is not None:
+                    return (float(match.group(1)) / 100) * unit_weight
+                match = re.search(r"\$([\d.]+)/unit", rate)
+                if match and quantity is not None:
+                    return float(match.group(1)) * quantity
+
     match = re.search(r"([\d.]+)\s*%", duty_str)
     if match:
-        rate = float(match.group(1)) / 100
-        result.update({
-            "rate": rate,
-            "amount": rate * cif_value if cif_value else 0,
-            "type": "percentage"
-        })
-        return result
-    
+        return float(match.group(1)) / 100
     match = re.search(r"([\d.]+)\s*¢/kg", duty_str)
-    if match and unit_weight and quantity:
-        cents_per_kg = float(match.group(1))
-        total_amount = (cents_per_kg * unit_weight * quantity) / 100
-        result.update({
-            "rate": total_amount / cif_value if cif_value else 0,
-            "amount": total_amount,
-            "type": "weight_based"
-        })
-        return result
+    if match and unit_weight is not None:
+        return (float(match.group(1)) / 100) * unit_weight
+    match = re.search(r"\$([\d.]+)/unit", duty_str)
+    if match and quantity is not None:
+        return float(match.group(1)) * quantity
+    return 0.0
+
+# Tariff Calculator Tool
+def calculate_tariff(inputs):
+    if isinstance(inputs, str):
+        try:
+            inputs = json.loads(inputs)
+        except:
+            params = {}
+            pattern = r"(\w+)\s*[:=]\s*([\w.]+)"
+            matches = re.findall(pattern, inputs)
+            for key, value in matches:
+                try:
+                    params[key] = float(value) if '.' in value else value
+                except:
+                    params[key] = value
+            inputs = params
     
-    match = re.search(r"\$([\d.]+)(?:/unit|/each|\s+each)", duty_str)
-    if match and quantity:
-        dollars_per_unit = float(match.group(1))
-        total_amount = dollars_per_unit * quantity
-        result.update({
-            "rate": total_amount / cif_value if cif_value else 0,
-            "amount": total_amount,
-            "type": "unit_based"
-        })
-        return result
+    hts_code = inputs.get("hts_code", "")
+    hts_code = re.sub(r'[^\d.]', '', hts_code).strip()
     
-    if "+" in duty_str:
-        parts = duty_str.split("+")
-        total_amount = 0
-        for part in parts:
-            sub_result = parse_duty_advanced(part.strip(), unit_weight, quantity, cif_value)
-            total_amount += sub_result["amount"]
-        result.update({
-            "amount": total_amount,
-            "rate": total_amount / cif_value if cif_value else 0,
-            "type": "compound"
-        })
-        return result
+    product_cost = float(inputs.get("product_cost", 0))
+    freight = float(inputs.get("freight", 0))
+    insurance = float(inputs.get("insurance", 0))
+    unit_weight = float(inputs.get("unit_weight", 0))
+    quantity = float(inputs.get("quantity", 0))
+    country = inputs.get("country", None)
+    unit_of_quantity = inputs.get("unit_of_quantity", None)
+
+    cif_value = product_cost + freight + insurance
+
+    query = "SELECT * FROM hts_data WHERE \"HTS Number\" = ?"
+    df = conn.execute(query, [hts_code]).fetch_df()
+    if df.empty:
+        alt_query = "SELECT * FROM hts_data WHERE \"HTS Number\" LIKE ?"
+        df = conn.execute(alt_query, [f"%{hts_code}%"]).fetch_df()
+        if df.empty:
+            logger.warning(f"No data found for HTS code: {hts_code}")
+            return f"No data found for HTS code {hts_code}. Please verify the code in the HTS database."
+
+    expected_unit = df["Unit of Quantity"].iloc[0].strip().lower()
+    if unit_of_quantity and unit_of_quantity.lower() != expected_unit:
+        st.warning(f"Input unit ({unit_of_quantity}) does not match HTS unit ({expected_unit}).")
+
+    quota_qty = df["Quota Quantity"].iloc[0]
+    if pd.notna(quota_qty) and quantity > float(quota_qty):
+        st.warning(f"Quantity ({quantity}) exceeds tariff-rate quota ({quota_qty}). Higher rates may apply.")
+
+    result = {
+        "HTS Number": hts_code,
+        "Description": df["Description"].iloc[0],
+        "Unit of Quantity": expected_unit,
+        "CIF Value": cif_value,
+        "Product Cost": product_cost,
+        "Freight": freight,
+        "Insurance": insurance,
+        "Unit Weight": unit_weight,
+        "Quantity": quantity,
+        "Country": country if country else "N/A"
+    }
+
+    duty_calculations = []
+    
+    for col in ["General Rate of Duty", "Special Rate of Duty", "Column 2 Rate of Duty"]:
+        duty_str = df[col].iloc[0]
+        parsed_rate = parse_duty_advanced(
+            duty_str,
+            unit_weight=unit_weight,
+            quantity=quantity,
+            cif_value=cif_value,
+            country=country
+        )
+        
+        if "%" in str(duty_str).lower():
+            duty_amount = parsed_rate * cif_value
+            rate_percent = parsed_rate * 100
+            result[f"{col} Rate (%)"] = rate_percent
+            duty_calculations.append(f"- {col}: {rate_percent:.2f}% of CIF Value = ${duty_amount:.2f}")
+        else:
+            duty_amount = parsed_rate
+            result[f"{col} Rate (%)"] = 0
+            duty_calculations.append(f"- {col}: {duty_str} = ${duty_amount:.2f}")
+            
+        result[f"{col} Duty Amount"] = duty_amount
+
+    add_duty_str = df["Additional Duties"].iloc[0]
+    add_duty_amount = parse_duty_advanced(
+        add_duty_str,
+        unit_weight=unit_weight,
+        quantity=quantity,
+        cif_value=cif_value
+    )
+    result["Additional Duties Amount"] = add_duty_amount
+    duty_calculations.append(f"- Additional Duties: {add_duty_str} = ${add_duty_amount:.2f}")
+
+    vat_rate = 0.05
+    vat_amount = cif_value * vat_rate
+    result["VAT Rate (%)"] = vat_rate * 100
+    result["VAT Amount"] = vat_amount
+    duty_calculations.append(f"- VAT: {vat_rate*100:.2f}% of CIF Value = ${vat_amount:.2f}")
+
+    total_duty = sum([result.get(f"{col} Duty Amount", 0) for col in ["General Rate of Duty", "Special Rate of Duty", "Column 2 Rate of Duty"]]) + add_duty_amount
+    result["Total Landed Cost"] = cif_value + total_duty + vat_amount
+    
+    calculation_steps = [
+        f"Calculation for HTS Code: {hts_code}",
+        f"Description: {result['Description']}",
+        "",
+        "Input Parameters:",
+        f"- Product Cost: ${product_cost:,.2f}",
+        f"- Freight: ${freight:,.2f}",
+        f"- Insurance: ${insurance:,.2f}",
+        f"- Unit Weight: {unit_weight} kg",
+        f"- Quantity: {quantity}",
+        f"- Country: {country if country else 'Not specified'}",
+        "",
+        "Calculation Steps:",
+        f"1. CIF Value = Product Cost + Freight + Insurance = ${cif_value:,.2f}",
+        "",
+        "2. Duty Calculations:"
+    ]
+    
+    calculation_steps.extend(duty_calculations)
+    
+    calculation_steps.extend([
+        "",
+        f"3. Total Duties = ${total_duty:,.2f}",
+        f"4. VAT (5%) = ${vat_amount:,.2f}",
+        f"5. Total Landed Cost = CIF Value + Total Duties + VAT = ${result['Total Landed Cost']:,.2f}",
+        "",
+        "Note: This calculation assumes standard VAT rate of 5%. Actual rates may vary."
+    ])
+    
+    st.session_state.detailed_calculation = "\n".join(calculation_steps)
     
     return result
 
-class QueryRouter:
-    @staticmethod
-    def classify_query(query: str) -> str:
-        """Classify query type for routing"""
-        query_lower = query.lower()
-        if re.search(r'\d{4}\.\d{2}\.\d{2}\.\d{2}', query):
-            if any(word in query_lower for word in ['calculate', 'duty', 'duties', 'cost']):
-                return "duty_calculation"
-            else:
-                return "hts_lookup"
-        if any(word in query_lower for word in ['calculate', 'duty', 'duties', 'cost', 'freight', 'insurance', '$', 'usd']):
-            return "duty_calculation"
-        if any(phrase in query_lower for phrase in ['hts code for', 'tariff code for', 'classification for']):
-            return "product_search"
-        if any(word in query_lower for word in ['agreement', 'fta', 'nafta', 'usmca', 'israel', 'policy', 'gsp', 'quota']):
-            return "trade_policy"
-        if any(word in query_lower for word in ['find', 'search', 'look for']):
-            return "description_search"
-        return "trade_policy"
+# Tools for Agent
+rag_tool = Tool(
+    name="GeneralNotes",
+    func=rag_tool_func,
+    description="Answers questions about trade policies, agreements, or classification rules."
+)
 
-class HTSDatabase:
-    @staticmethod
-    def lookup_hts_code(hts_code: str) -> Dict[str, Any]:
-        try:
-            conn = sqlite3.connect(Config.DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM hts_codes WHERE hts_code = ?", (hts_code,))
-            result = cursor.fetchone()
-            if not result:
-                return {"error": "HTS code not found"}
-            columns = [desc[0] for desc in cursor.description]
-            return dict(zip(columns, result))
-        except Exception as e:
-            logger.error(f"Failed to lookup HTS code {hts_code}: {e}")
-            return {"error": f"Database error: {str(e)}"}
-        finally:
-            conn.close()
-    
-    @staticmethod
-    def search_hts_description(search_term: str) -> List[Dict[str, Any]]:
-        try:
-            conn = sqlite3.connect(Config.DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute("""
-            SELECT hts_code, description 
-            FROM hts_codes 
-            WHERE description LIKE ? 
-            LIMIT 10
-            """, (f"%{search_term}%",))
-            results = cursor.fetchall()
-            return [{"hts_code": r[0], "description": r[1]} for r in results]
-        except Exception as e:
-            logger.error(f"Failed to search HTS description for '{search_term}': {e}")
-            return [{"error": f"Database error: {str(e)}"}]
-        finally:
-            conn.close()
-    
-    @staticmethod
-    def calculate_duties(hts_code: str, product_cost: float, freight: float, 
-                        insurance: float, quantity: int, unit_weight: float,
-                        origin_country: Optional[str] = None) -> Dict[str, Any]:
-        try:
-            if not HTSValidator.validate_hts_code(hts_code):
-                return {"error": f"Invalid HTS code format: {hts_code}. Expected format: XXXX.XX.XX.XX"}
-            
-            hts_data = HTSDatabase.lookup_hts_code(hts_code)
-            if "error" in hts_data:
-                return hts_data
-            
-            cif_value = product_cost + freight + insurance
-            duty_breakdown = {}
-            
-            for duty_type in ["general_rate_of_duty", "special_rate_of_duty", "column_2_rate_of_duty"]:
-                duty_str = hts_data.get(duty_type)
-                parsed = parse_duty_advanced(duty_str, unit_weight, quantity, cif_value)
-                duty_breakdown[duty_type] = parsed
-            
-            total_duties = sum(d["amount"] for d in duty_breakdown.values())
-            landed_cost = cif_value + total_duties
-            vat_rate = 0.1
-            vat_amount = landed_cost * vat_rate
-            total_cost = landed_cost + vat_amount
-            
-            fta_status = ""
-            if origin_country:
-                conn = sqlite3.connect(Config.DB_NAME)
-                cursor = conn.cursor()
-                cursor.execute("SELECT * FROM country_codes WHERE code = ?", (origin_country,))
-                result = cursor.fetchone()
-                conn.close()
-                
-                if result:
-                    country_data = dict(zip([desc[0] for desc in cursor.description], result))
-                    if country_data.get('is_fta_member') == 1:
-                        fta_status = f"✅ {country_data['name']} ({origin_country}) has preferential trade status under {country_data['fta_name']}. Special rates may apply."
-                    else:
-                        fta_status = f"❌ {country_data['name']} ({origin_country}) has MFN (Most Favored Nation) status only."
-            
-            return {
-                "hts_code": hts_code,
-                "description": hts_data.get("description"),
-                "cif_value": cif_value,
-                "duty_breakdown": duty_breakdown,
-                "total_duties": total_duties,
-                "landed_cost": landed_cost,
-                "vat_rate": vat_rate,
-                "vat_amount": vat_amount,
-                "total_cost": total_cost,
-                "fta_status": fta_status,
-                "calculation_details": {
-                    "product_cost": product_cost,
-                    "freight": freight,
-                    "insurance": insurance,
-                    "quantity": quantity,
-                    "unit_weight": unit_weight,
-                    "origin_country": origin_country
-                }
-            }
-        except Exception as e:
-            logger.error(f"Failed to calculate duties for HTS code {hts_code}: {e}")
-            return {"error": f"Calculation error: {str(e)}"}
-    
-    @staticmethod
-    def log_query(query_type: str, query_text: str, response_text: str):
-        try:
-            conn = sqlite3.connect(Config.DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO query_history (timestamp, query_type, query_text, response_text) VALUES (?, ?, ?, ?)",
-                (datetime.now().isoformat(), query_type, query_text, response_text)
-            )
-            conn.commit()
-        except Exception as e:
-            logger.error(f"Failed to log query: {e}")
-        finally:
-            conn.close()
+hts_lookup_tool = Tool(
+    name="HTSLookup",
+    func=hts_lookup_func,
+    description="Finds HTS codes for products based on description."
+)
 
-class ResponseFormatter:
-    @staticmethod
-    def format_hts_lookup(data: Dict[str, Any]) -> str:
-        if "error" in data:
-            return data["error"]
-        
-        response = f"**HTS Code: {data['hts_code']}**\n\n"
-        response += f"**Classification:** Section {data['section']}, Chapter {data['chapter']}\n"
-        response += f"**Description:** {data['description']}\n\n"
-        response += f"**Duty Rates:**\n"
-        response += f"- General Rate: {data['general_rate_of_duty']}\n"
-        response += f"- Special Rate: {data['special_rate_of_duty']}\n"
-        response += f"- Column 2 Rate: {data['column_2_rate_of_duty']}\n"
-        
-        if data.get('additional_duties'):
-            response += f"- Additional Duties: {data['additional_duties']}\n"
-        
-        if data.get('unit_of_quantity'):
-            response += f"\n**Unit of Quantity:** {data['unit_of_quantity']}\n"
-            
-        return response
+tariff_tool = Tool(
+    name="TariffCalculator",
+    func=calculate_tariff,
+    description="Calculates duties and landed costs for HTS codes."
+)
+
+# Initialize Agent with  error handling
+memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+tools = [rag_tool, hts_lookup_tool, tariff_tool]
+agent_executor = initialize_agent(
+    tools,
+    llm,
+    agent="zero-shot-react-description",
+    verbose=True,
+    memory=memory,
+    handle_parsing_errors=(
+        "Check your output and make sure it conforms! "
+        "Use the exact format: Action: [tool_name] without any extra characters, "
+        "followed by Action Input: [input] on a new line."
+    ),
+    max_iterations=5,
+    early_stopping_method="generate",
+    return_intermediate_steps=True
+)
+
+# Streamlit Frontend
+def generate_pdf(report_data, calculation_steps):
+    pdf_path = f"hts_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    c = canvas.Canvas(pdf_path, pagesize=letter)
     
-    @staticmethod
-    def format_duty_calculation(data: Dict[str, Any]) -> str:
-        if "error" in data:
-            return data["error"]
-        
-        response = f"**Duty Calculation for HTS {data['hts_code']}**\n\n"
-        response += f"**Product:** {data['description']}\n\n"
-        
-        response += f"**Cost Breakdown:**\n"
-        response += f"- Product Cost: ${data['calculation_details']['product_cost']:,.2f}\n"
-        response += f"- Freight: ${data['calculation_details']['freight']:,.2f}\n"
-        response += f"- Insurance: ${data['calculation_details']['insurance']:,.2f}\n"
-        response += f"- **CIF Value: ${data['cif_value']:,.2f}**\n\n"
-        
-        response += f"**Duty Details:**\n"
-        if data.get('duty_breakdown'):
-            for duty_type, details in data['duty_breakdown'].items():
-                response += f"- {duty_type.replace('_', ' ').title()}: ${details['amount']:,.2f} ({details['type']})\n"
-        
-        response += f"\n**Summary:**\n"
-        response += f"- Total Duties: ${data['total_duties']:,.2f}\n"
-        response += f"- Landed Cost: ${data['landed_cost']:,.2f}\n"
-        response += f"- VAT ({data['vat_rate']*100}%): ${data['vat_amount']:,.2f}\n"
-        response += f"- **Final Cost: ${data['total_cost']:,.2f}**\n"
-        
-        if data.get("fta_status"):
-            response += f"\n**Trade Agreement Status:**\n{data['fta_status']}\n"
-            
-        return response
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(100, 750, "HTS Duty Report")
+    c.setFont("Helvetica", 12)
     
-    @staticmethod
-    def format_hts_search(results: List[Dict[str, Any]]) -> str:
-        if not results or "error" in results[0]:
-            return results[0].get("error", "No results found")
-        
-        response = "**Search Results:**\n\n"
-        for result in results:
-            response += f"- **HTS Code**: {result['hts_code']}\n"
-            response += f"  **Description**: {result['description']}\n\n"
-        return response
-
-class RAGSystem:
-    def __init__(self):
-        try:
-            self.vectorstore = FAISS.load_local(Config.VECTOR_STORE_PATH, embeddings, allow_dangerous_deserialization=True)
-            self.memory = ConversationBufferMemory(
-                memory_key="chat_history",
-                return_messages=True
-            )
-            qa_prompt = PromptTemplate(
-                template=CUSTOM_PROMPT_TEMPLATE,
-                input_variables=["context", "question"]
-            )
-            self.qa_chain = ConversationalRetrievalChain.from_llm(
-                llm=llm,
-                chain_type="stuff",
-                retriever=self.vectorstore.as_retriever(),
-                memory=self.memory,
-                combine_docs_chain_kwargs={"prompt": qa_prompt}
-            )
-        except Exception as e:
-            logger.error(f"Failed to initialize RAG system: {e}")
-            self.qa_chain = None
+    y = 700
+    for key, value in report_data.items():
+        c.drawString(100, y, f"{key}: {value}")
+        y -= 20
     
-    def query(self, question: str) -> str:
-        if not self.qa_chain:
-            return "The RAG system is not properly initialized. Please initialize the system."
-        try:
-            result = self.qa_chain({"question": question})
-            HTSDatabase.log_query("RAG", question, result["answer"])
-            return result["answer"]
-        except Exception as e:
-            logger.error(f"RAG query failed: {e}")
-            return f"Query error: {str(e)}"
+    c.drawString(100, y-40, "Calculation Steps:")
+    y -= 60
+    
+    lines = calculation_steps.split('\n')
+    for line in lines:
+        if y < 100:
+            c.showPage()
+            y = 750
+            c.setFont("Helvetica", 12)
+        c.drawString(110, y, line)
+        y -= 15
+    
+    c.save()
+    return pdf_path
 
-# Export Functions
-def export_to_pdf(data: Dict[str, Any], filename: str):
-    try:
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Arial", size=12)
-        pdf.cell(200, 10, txt="TariffBot Duty Calculation Report", ln=1, align="C")
-        pdf.cell(200, 10, txt=f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=1, align="C")
-        pdf.ln(10)
-        pdf.set_font("Arial", size=10, style="B")
-        pdf.cell(50, 10, txt="HTS Code:", ln=0)
-        pdf.set_font("Arial", size=10)
-        pdf.cell(0, 10, txt=data.get("hts_code", ""), ln=1)
-        pdf.set_font("Arial", size=10, style="B")
-        pdf.cell(50, 10, txt="Description:", ln=0)
-        pdf.set_font("Arial", size=10)
-        pdf.multi_cell(0, 10, txt=data.get("description", ""))
-        pdf.ln(5)
-        pdf.set_font("Arial", size=10, style="B")
-        pdf.cell(0, 10, txt="Calculation Results:", ln=1)
-        pdf.set_font("Arial", size=10)
-        for key, value in data.items():
-            if key not in ["description", "hts_code", "calculation_details", "fta_status"]:
-                pdf.cell(50, 10, txt=f"{key.replace('_', ' ').title()}:", ln=0)
-                pdf.cell(0, 10, txt=f"${value:,.2f}" if isinstance(value, (int, float)) else str(value), ln=1)
-        if data.get("fta_status"):
-            pdf.ln(5)
-            pdf.set_font("Arial", size=10, style="I")
-            pdf.multi_cell(0, 10, txt=data["fta_status"])
-        pdf.output(filename)
-        logger.info(f"Exported PDF to {filename}")
-    except Exception as e:
-        logger.error(f"Failed to export PDF: {e}")
-        raise
+def generate_excel(report_data, calculation_steps):
+    excel_path = f"hts_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    
+    report_df = pd.DataFrame([report_data])
+    
+    steps_df = pd.DataFrame({
+        "Calculation Steps": calculation_steps.split('\n')
+    })
+    
+    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+        report_df.to_excel(writer, sheet_name='Duty Calculation', index=False)
+        steps_df.to_excel(writer, sheet_name='Calculation Steps', index=False)
+    
+    return excel_path
 
-def export_to_excel(data: Dict[str, Any], filename: str):
-    try:
-        result_data = {
-            "Field": [],
-            "Value": []
-        }
-        for key, value in data.items():
-            if key not in ["calculation_details"]:
-                result_data["Field"].append(key.replace('_', ' ').title())
-                result_data["Value"].append(f"${value:,.2f}" if isinstance(value, (int, float)) else str(value))
-        df = pd.DataFrame(result_data)
-        writer = pd.ExcelWriter(filename, engine='xlsxwriter')
-        df.to_excel(writer, sheet_name='Duty Calculation', index=False)
-        if "calculation_details" in data:
-            details_df = pd.DataFrame(list(data["calculation_details"].items()), columns=["Parameter", "Value"])
-            details_df.to_excel(writer, sheet_name='Input Parameters', index=False)
-        writer.close()
-        logger.info(f"Exported Excel to {filename}")
-    except Exception as e:
-        logger.error(f"Failed to export Excel: {e}")
-        raise
+def format_tariff_result(result):
+    if isinstance(result, dict):
+        currency_fields = ["CIF Value", "Product Cost", "Freight", "Insurance", 
+                          "General Rate of Duty Duty Amount", "Special Rate of Duty Duty Amount",
+                          "Column 2 Rate of Duty Duty Amount", "Additional Duties Amount",
+                          "VAT Amount", "Total Landed Cost"]
+        for field in currency_fields:
+            if field in result:
+                result[field] = f"${float(result[field]):,.2f}"
+        rate_fields = ["General Rate of Duty Rate (%)", "Special Rate of Duty Rate (%)", 
+                      "Column 2 Rate of Duty Rate (%)", "VAT Rate (%)"]
+        for field in rate_fields:
+            if field in result:
+                result[field] = f"{float(result[field]):.2f}%"
+        if "Quantity" in result:
+            result["Quantity"] = f"{float(result['Quantity']):,.0f} units"
+        if "Unit Weight" in result:
+            result["Unit Weight"] = f"{float(result['Unit Weight']):,.2f} kg"
+    return result
 
-# Streamlit Application
-@st.cache_data
-def get_all_hts_codes():
-    """Get all HTS codes for validation"""
-    try:
-        conn = sqlite3.connect(Config.DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("SELECT hts_code FROM hts_codes LIMIT 1000")
-        codes = [row[0] for row in cursor.fetchall()]
-        return codes
-    except Exception as e:
-        return []
-    finally:
-        conn.close()
+def is_duty_related_query(query):
+    duty_keywords = ["duty", "tariff", "cost", "calculate", "rate", "hts_code", "product_cost", "freight", "insurance", "quantity"]
+    return any(keyword in query.lower() for keyword in duty_keywords)
+
+def parse_query_params(query):
+    params = {}
+    query_lower = query.lower()
+    
+    # Extract HTS code
+    hts_match = re.search(r'\b(\d{4}\.\d{2}\.\d{2}\.\d{2})\b', query)
+    if hts_match:
+        params["hts_code"] = hts_match.group(1)
+    
+    # Extract product cost
+    cost_match = re.search(r'product cost.*?\b\$?([\d,]+(?:\.\d+)?)\b', query_lower, re.IGNORECASE)
+    if cost_match:
+        params["product_cost"] = float(cost_match.group(1).replace(",", ""))
+    
+    # Extract weight
+    weight_match = re.search(r'(\d+\.?\d*)\s*kg(?:\s*weight)?', query_lower)
+    if weight_match:
+        params["unit_weight"] = float(weight_match.group(1))
+    
+    # Extract quantity
+    quantity_match = re.search(r'(\d+\.?\d*)\s*units?', query_lower)
+    if quantity_match:
+        params["quantity"] = float(quantity_match.group(1))
+    
+    # Extract country
+    country_match = re.search(r'country\s*[:=]\s*(\w+)', query_lower)
+    if country_match:
+        params["country"] = country_match.group(1)
+    
+    # Extract freight and insurance if provided
+    freight_match = re.search(r'freight\s*[:=]\s*\$?([\d,]+(?:\.\d+)?)', query_lower)
+    if freight_match:
+        params["freight"] = float(freight_match.group(1).replace(",", ""))
+    else:
+        params["freight"] = 0.0
+    
+    insurance_match = re.search(r'insurance\s*[:=]\s*\$?([\d,]+(?:\.\d+)?)', query_lower)
+    if insurance_match:
+        params["insurance"] = float(insurance_match.group(1).replace(",", ""))
+    else:
+        params["insurance"] = 0.0
+    
+    return params
+
+def classify_and_rewrite_query(query):
+    query_lower = query.lower()
+    if any(k in query_lower for k in ["what is", "explain", "how is", "classification", "trade agreement"]):
+        return f"Use GeneralNotes to answer: {query}"
+    elif "hts code for" in query_lower or "hts code of" in query_lower:
+        product = re.search(r'hts code (?:for|of) (.+?)(?:\?|,|$)', query_lower, re.IGNORECASE)
+        if product:
+            product_name = product.group(1).strip()
+            return f"Use HTSLookup to find the HTS code for '{product_name}'"
+    elif "given hts code" in query_lower and any(k in query_lower for k in ["cost", "weight", "quantity"]):
+        params = parse_query_params(query)
+        if "hts_code" in params:
+            # Validate required parameters
+            required_params = ["hts_code", "product_cost", "quantity"]
+            missing_params = [p for p in required_params if p not in params or params[p] == 0]
+            if missing_params:
+                logger.warning(f"Missing required parameters: {missing_params}")
+                return f"Error: Missing required parameters: {', '.join(missing_params)}"
+            return f"Use TariffCalculator with input: {json.dumps(params)}"
+    elif "duty rates for" in query_lower:
+        product = re.search(r'duty rates for (.+?)(?:\?|,|$)', query_lower, re.IGNORECASE)
+        if product:
+            product_name = product.group(1).strip()
+            return f"Use HTSLookup to find HTS codes for '{product_name}'"
+    return query
 
 def main():
-    st.set_page_config(
-        page_title="TariffBot - HTS AI Agent",
-        page_icon="🌐",
-        layout="wide"
-    )
-
-    # Initialize session state
-    if "initialized" not in st.session_state:
-        st.session_state.initialized = False
-        st.session_state.rag_system = None
-        st.session_state.error_message = None
-    if "force_reingest" not in st.session_state:
-        st.session_state.force_reingest = False
-
-    # Sidebar navigation
-    st.sidebar.title("TariffBot")
-    st.sidebar.markdown("""
-    Welcome to TariffBot — your intelligent assistant for U.S. Harmonized Tariff Schedule (HTS) queries.  
-    Select an option below to get started.
-    """)
-    option = st.sidebar.selectbox(
-        "Choose an Action",
-        ["Home", "Lookup HTS Code", "Search HTS Description", "Calculate Duties", "Ask Trade Question"]
-    )
-    st.sidebar.markdown("---")
-    st.session_state.force_reingest = st.sidebar.checkbox(
-        "Force PDF Re-ingestion",
-        value=st.session_state.force_reingest,
-        help="Enable to re-process General Notes.pdf on next initialization. Uncheck to use existing FAISS index."
-    )
-
-    # Initialize system
-    @st.cache_resource
-    def init_system(force_reingest):
-        try:
-            success, msg = initialize_system(force_reingest=force_reingest)
-            if success:
-                rag_system = RAGSystem()
-                if rag_system.qa_chain is None:
-                    return False, "Failed to initialize RAG system.", None
-                return True, "System initialized successfully.", rag_system
-            return False, msg, None
-        except Exception as e:
-            logger.error(f"Initialization error: {e}")
-            return False, f"Initialization failed: {str(e)}", None
-
-    # Perform initialization
-    if not st.session_state.initialized:
-        with st.spinner("Initializing TariffBot..."):
-            success, msg, rag_system = init_system(st.session_state.force_reingest)
-            if success:
-                st.session_state.initialized = True
-                st.session_state.rag_system = rag_system
-                st.success(msg)
-            else:
-                st.session_state.error_message = msg
-                st.error(msg)
-
-    # Main content
-    st.title("TariffBot - HTS AI Agent")
-    st.markdown("""
-    TariffBot is powered by U.S. International Trade Commission data to assist importers, analysts, and trade professionals.  
-    I provide clear, compliant, and factual answers grounded in official HTS documentation.  
-    Use the sidebar to navigate through my capabilities.
-    """)
-
-    if st.session_state.error_message:
-        st.error(f"System Error: {st.session_state.error_message}")
-        st.stop()
-
-    if st.session_state.initialized:
-        if option == "Home":
-            st.header("Welcome to TariffBot")
-            quick_query = st.text_input("Quick Query (I'll route it automatically):", "")
-            if quick_query:
-                query_type = QueryRouter.classify_query(quick_query)
-                st.info(f"Query classified as: {query_type}")
-                
-                if query_type == "hts_lookup":
-                    hts_match = re.search(r'(\d{4}\.\d{2}\.\d{2}\.\d{2})', quick_query)
-                    if hts_match:
-                        result = HTSDatabase.lookup_hts_code(hts_match.group(1))
-                        st.write(ResponseFormatter.format_hts_lookup(result))
-                
-                elif query_type == "product_search":
-                    search_term = quick_query.replace("hts code for", "").replace("tariff code for", "").strip()
-                    results = HTSDatabase.search_hts_description(search_term)
-                    st.write(ResponseFormatter.format_hts_search(results))
-                
-                elif query_type in ["trade_policy", "description_search"]:
-                    answer = st.session_state.rag_system.query(quick_query)
-                    st.write(answer)
+    st.set_page_config(page_title="TariffBot - HTS AI Agent", layout="wide")
+    st.title("TariffBot 🌎 - Your HTS AI Assistant")
+    
+    if 'detailed_calculation' not in st.session_state:
+        st.session_state.detailed_calculation = None
+    
+    if 'data_loaded' not in st.session_state:
+        with st.spinner("Ingesting data..."):
+            ingest_data()
+            st.session_state.data_loaded = True
+    
+    query = st.text_input("Enter your query (e.g., 'What is United States-Israel Free Trade?', 'What’s the HTS code for donkeys?', 'What are the duty rates for veal?', or 'Given HTS code 0101.30.00.00, product cost of $10,000, 500 kg weight, and 5 units — what are all applicable duties?')")
+    
+    if st.button("Submit Query"):
+        st.session_state.detailed_calculation = None
+        
+        if 'last_query' in st.session_state and st.session_state.last_query == query:
+            st.warning("Query already processed. Please enter a new query.")
+            return
             
-            st.markdown("""
-            ### What I Can Do:
-            - **Lookup HTS Codes**: Find detailed information about specific HTS codes.
-            - **Search Descriptions**: Search for HTS codes by product description.
-            - **Calculate Duties**: Compute duties, landed costs, and VAT based on HTS codes and shipment details.
-            - **Answer Trade Questions**: Get insights on trade policies and agreements using official HTS General Notes.
-
-            ### Sample Queries:
-            - **RAG Agent**:
-              - What is the United States-Israel Free Trade Agreement?
-              - Can a product exceeding its tariff-rate quota qualify for duty-free entry under GSP or FTA?
-              - How is classification determined for imported manufacturing parts?
-            - **Tariff Agent**:
-              - Calculate duties for HTS code 0101.30.00.00 with $10,000 product cost, 500 kg, 5 units.
-              - Find the HTS code for donkeys.
-              - What are the duty rates for female cattle?
-            """)
+        st.session_state.last_query = query
         
-        elif option == "Lookup HTS Code":
-            st.header("Lookup HTS Code")
-            hts_code = st.text_input("Enter HTS Code (e.g., 0101.30.00.00)", "").strip()
-            if st.button("Lookup"):
-                if hts_code:
-                    with st.spinner("Fetching HTS code details..."):
-                        result = HTSDatabase.lookup_hts_code(hts_code)
-                        formatted_response = ResponseFormatter.format_hts_lookup(result)
-                        st.write(formatted_response)
-                        with st.expander("View raw data"):
-                            if "error" not in result:
-                                df = pd.DataFrame([result])
-                                st.dataframe(df, use_container_width=True)
-                else:
-                    st.warning("Please enter an HTS code.")
-        
-        elif option == "Search HTS Description":
-            st.header("Search HTS Description")
-            search_term = st.text_input("Enter Search Term (e.g., donkeys)", "").strip()
-            if st.button("Search"):
-                if search_term:
-                    with st.spinner("Searching HTS descriptions..."):
-                        results = HTSDatabase.search_hts_description(search_term)
-                        formatted_response = ResponseFormatter.format_hts_search(results)
-                        st.write(formatted_response)
-                        with st.expander("View raw data"):
-                            if not results or "error" in results[0]:
-                                st.error(results[0].get("error", "No results found"))
-                            else:
-                                df = pd.DataFrame(results)
-                                st.dataframe(df, use_container_width=True)
-                else:
-                    st.warning("Please enter a search term.")
-        
-        elif option == "Calculate Duties":
-            st.header("Calculate Duties")
-            with st.form("duty_calculator_form"):
-                hts_code = st.text_input("HTS Code (e.g., 0101.30.00.00)", "").strip()
-                product_cost = st.number_input("Product Cost (USD)", min_value=0.0, step=100.0)
-                freight = st.number_input("Freight Cost (USD)", min_value=0.0, step=50.0)
-                insurance = st.number_input("Insurance Cost (USD)", min_value=0.0, step=10.0)
-                quantity = st.number_input("Quantity", min_value=1, step=1, format="%d")
-                unit_weight = st.number_input("Unit Weight (kg)", min_value=0.0, step=0.1)
-                origin_country = st.text_input("Origin Country Code (e.g., US) [Optional]", "").strip().upper()
-                origin_country = origin_country if origin_country else None
-                export_option = st.selectbox("Export Results", ["None", "PDF", "Excel"])
-                submitted = st.form_submit_button("Calculate")
-
-            if submitted:
-                if not hts_code:
-                    st.warning("Please enter an HTS code.")
-                else:
+        with st.spinner("Processing query..."):
+            try:
+                logger.info(f"Processing query: {query}")
+                rewritten_query = classify_and_rewrite_query(query)
+                if rewritten_query.startswith("Error"):
+                    st.error(rewritten_query)
+                    return
+                agent_output = agent_executor.invoke({"input": rewritten_query})
+                
+                result = None
+                for step in agent_output.get("intermediate_steps", []):
+                    if step[0].tool == "TariffCalculator":
+                        try:
+                            result = json.loads(step[1]) if isinstance(step[1], str) else step[1]
+                            break
+                        except:
+                            continue
+                
+                if not result:
                     try:
-                        with st.spinner("Calculating duties..."):
-                            result = HTSDatabase.calculate_duties(
-                                hts_code, product_cost, freight, insurance, quantity, unit_weight, origin_country
-                            )
-                            formatted_response = ResponseFormatter.format_duty_calculation(result)
-                            st.write(formatted_response)
-                            
-                            if export_option != "None":
-                                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                filename = f"duty_report_{hts_code}_{timestamp}.{export_option.lower()}"
-                                if export_option == "PDF":
-                                    export_to_pdf(result, filename)
-                                    st.success(f"Exported PDF to {filename}")
-                                    with open(filename, "rb") as f:
-                                        st.download_button(
-                                            label="Download PDF",
-                                            data=f,
-                                            file_name=filename,
-                                            mime="application/pdf"
-                                        )
-                                elif export_option == "Excel":
-                                    export_to_excel(result, filename)
-                                    st.success(f"Exported Excel to {filename}")
-                                    with open(filename, "rb") as f:
-                                        st.download_button(
-                                            label="Download Excel",
-                                            data=f,
-                                            file_name=filename,
-                                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                                        )
-                    except Exception as e:
-                        st.error(f"Error in calculation: {str(e)}")
-        
-        elif option == "Ask Trade Question":
-            st.header("Ask Trade Question")
-            question = st.text_area("Enter your question about trade policies or agreements", "").strip()
-            if st.button("Submit Question"):
-                if question:
-                    with st.spinner("Processing your question..."):
-                        answer = st.session_state.rag_system.query(question)
-                        st.subheader("Answer")
-                        st.write(answer)
+                        result = json.loads(agent_output["output"]) if isinstance(agent_output["output"], str) else agent_output["output"]
+                    except:
+                        result = agent_output["output"]
+                
+                if isinstance(result, dict):
+                    formatted = format_tariff_result(result.copy())
+                    
+                    st.subheader("Duty Calculation Results")
+                    
+                    if st.session_state.detailed_calculation:
+                        with st.expander("View Detailed Calculation Steps"):
+                            st.text(st.session_state.detailed_calculation)
+                    
+                    st.subheader("Summary")
+                    df = pd.DataFrame([formatted])
+                    st.dataframe(df)
+                    
+                    if st.session_state.detailed_calculation:
+                        st.subheader("Download Report")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            excel_path = generate_excel(formatted, st.session_state.detailed_calculation)
+                            with open(excel_path, "rb") as f:
+                                st.download_button(
+                                    label="Download Excel Report",
+                                    data=f,
+                                    file_name=excel_path,
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key=f"excel_download_{datetime.now().timestamp()}"
+                                )
+                        with col2:
+                            pdf_path = generate_pdf(formatted, st.session_state.detailed_calculation)
+                            with open(pdf_path, "rb") as f:
+                                st.download_button(
+                                    label="Download PDF Report",
+                                    data=f,
+                                    file_name=pdf_path,
+                                    mime="application/pdf",
+                                    key=f"pdf_download_{datetime.now().timestamp()}"
+                                )
+                elif isinstance(result, str):
+                    if "No data found for HTS code" in result:
+                        st.error(result)
+                    else:
+                        st.subheader("Response")
+                        st.write(result)
                 else:
-                    st.warning("Please enter a question.")
-
-    # Footer
-    st.markdown("---")
-    st.markdown("""
-    Built to assist with U.S. HTS queries. For manual review, visit [hts.usitc.gov](https://hts.usitc.gov).  
-    If a query is ambiguous, I'll recommend checking the relevant HTS section.
-    """)
+                    st.error("Unexpected response format from agent.")
+                
+            except Exception as e:
+                logger.error(f"Error processing query: {str(e)}")
+                st.error(f"Error processing query: {str(e)}")
+                if is_duty_related_query(query):
+                    params = parse_query_params(query)
+                    if "hts_code" in params:
+                        result = calculate_tariff(params)
+                        if isinstance(result, dict):
+                            formatted = format_tariff_result(result.copy())
+                            
+                            st.subheader("Duty Calculation Results (Fallback)")
+                            if st.session_state.detailed_calculation:
+                                with st.expander("View Detailed Calculation Steps"):
+                                    st.text(st.session_state.detailed_calculation)
+                            
+                            st.subheader("Summary")
+                            df = pd.DataFrame([formatted])
+                            st.dataframe(df)
+                            
+                            st.subheader("Download Report")
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                excel_path = generate_excel(formatted, st.session_state.detailed_calculation)
+                                with open(excel_path, "rb") as f:
+                                    st.download_button(
+                                        label="Download Excel Report",
+                                        data=f,
+                                        file_name=excel_path,
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        key=f"excel_download_fallback_{datetime.now().timestamp()}"
+                                    )
+                            with col2:
+                                pdf_path = generate_pdf(formatted, st.session_state.detailed_calculation)
+                                with open(pdf_path, "rb") as f:
+                                    st.download_button(
+                                        label="Download PDF Report",
+                                        data=f,
+                                        file_name=pdf_path,
+                                        mime="application/pdf",
+                                        key=f"pdf_download_fallback_{datetime.now().timestamp()}"
+                                    )
+                        else:
+                            st.error(result)
 
 if __name__ == "__main__":
     main()
