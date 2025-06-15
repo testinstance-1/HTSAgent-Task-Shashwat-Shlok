@@ -132,15 +132,7 @@ A demo video showcasing TariffBot’s RAG and tariff calculator capabilities is 
 - RAG: United States-Israel FTA, tariff-rate quotas, and classification rules.
 - Tariff: Duty calculation for HTS 0101.30.00.00, HTS code for donkeys, and duty rates for female cattle.
 
-## Submission Details
 
-This project was developed by Shashwat Shlok for the HTS AI Agent coding task. For feedback or inquiries, contact:
-- Email: sshashwat10@gmail.com
-- GitHub: [ShashwatShlok/HTSAgent-Task-Shashwat-Shlok](https://github.com/ShashwatShlok/HTSAgent-Task-Shashwat-Shlok)
-- Submission Email:
-  - To: santosh@personaliz.ai
-  - CC: aniketms42@gmail.com
-  - Subject: HTS AI Task – Shashwat Shlok
 
 ## Acknowledgments
 
